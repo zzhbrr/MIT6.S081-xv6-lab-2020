@@ -52,6 +52,8 @@ exec(char *path, char **argv)
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
     sz = sz1;
+    if(sz >= PLIC)
+      goto bad;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
     if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
@@ -100,7 +102,7 @@ exec(char *path, char **argv)
   // arguments to user main(argc, argv)
   // argc is returned via the system call return
   // value, which goes in a0.
-  p->trapframe->a1 = sp;
+  p->trapframe->a1 = sp; // argc会被syscall()放入p->trapframe->a0, 所以将argv放入p->trapframe->a1
 
   // Save program name for debugging.
   for(last=s=path; *s; s++)
@@ -111,11 +113,19 @@ exec(char *path, char **argv)
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
+
+  // 清除内核页表中对程序内存的旧映射，然后重新建立映射。
+  uvmunmap(p->k_pagetable, 0, PGROUNDDOWN(p->sz)/PGSIZE, 0);
+  uvmcopy_not_physical(pagetable, p->k_pagetable, 0, sz);
+
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  if(p->pid == 1) {
+    vmprint(p->pagetable);
+  }
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:

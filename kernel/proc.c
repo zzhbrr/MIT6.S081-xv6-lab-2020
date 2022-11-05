@@ -34,12 +34,13 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // 可以不在procinit的时候将内核页表中所有进程分配内核栈，因为每个进程有自己的内核页
+      // char *pa = kalloc();
+      // if(pa == 0)
+      //   panic("kalloc");
+      // uint64 va = KSTACK((int) (p - proc));
+      // kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      // p->kstack = va;
   }
   kvminithart();
 }
@@ -120,6 +121,24 @@ found:
     release(&p->lock);
     return 0;
   }
+  
+  // 创建用户进程内核页表
+  p->k_pagetable = proc_kvminit();
+  if(p->k_pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 初始化当前内核页表的内核栈
+  char *pa = kalloc(); // 从内存中分配一个页面大小空间，用于存内核栈
+  if (pa == 0)
+    panic("kalloc");
+  // 将内核栈映射到用户内核页表固定的部分
+  uint64 va = KSTACK((int)0);
+  // 添加kernel stack的映射到用户的kernel pagetable中
+  ukvmmap(p->k_pagetable, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va; // kstack指的是在内核页表下内核栈的虚拟地址
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -137,7 +156,7 @@ static void
 freeproc(struct proc *p)
 {
   if(p->trapframe)
-    kfree((void*)p->trapframe);
+    kfree((void*)p->trapframe); // 需要单独删除p->trapframe
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
@@ -149,6 +168,15 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  // 删除内核栈
+  if(p->k_pagetable) {
+    uvmunmap(p->k_pagetable, p->kstack, 1, 1);
+  }
+  p->kstack = 0;
+  // 递归释放进程的内核页表空间
+  if(p->k_pagetable)
+    proc_freekpagetable(p->k_pagetable);
+  p->k_pagetable = 0;
   p->state = UNUSED;
 }
 
@@ -195,6 +223,24 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+// 释放用户进程的内核页表, 并释放引用的物理内存
+void
+proc_freekpagetable(pagetable_t kpagetable)
+{
+  for (int i = 0; i < 512; i ++) {
+    pte_t pte = kpagetable[i];
+    if (pte & PTE_V) {
+      kpagetable[i] = 0; // 清除映射
+      if ((pte & (PTE_W | PTE_R | PTE_X)) == 0) { // 不是最后一层
+        proc_freekpagetable((pagetable_t)PTE2PA(pte));
+      } else {
+        continue; // 是最后一层，我们不需要释放物理内存
+      }
+    }
+  }
+  kfree((void*)kpagetable);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -220,6 +266,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  uvmcopy_not_physical(p->pagetable, p->k_pagetable, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -243,11 +290,21 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(PGROUNDDOWN(sz + n) >= PLIC) // 控制用户进程最大的虚拟地址为PLIC
+      return -1;
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    uvmcopy_not_physical(p->pagetable, p->k_pagetable, p->sz, sz);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 用户空间减少，内核页表取消相应映射
+    int newsz = p->sz + n;
+    if(PGROUNDDOWN(newsz) < PGROUNDUP(p->sz))
+    {
+      int npages = (PGROUNDUP(p->sz) - PGROUNDUP(newsz)) / PGSIZE;
+      uvmunmap(p->k_pagetable, PGROUNDUP(newsz), npages, 0);
+    }
   }
   p->sz = sz;
   return 0;
@@ -268,7 +325,7 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 || uvmcopy_not_physical(np->pagetable, np->k_pagetable, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -473,10 +530,19 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换 satp 寄存器为目前进程的内核页表
+        // uvmkernelpage_swtch(p->k_pagetable);
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        
+        // 进程执行结束，satp设置为全局内核页表kerbel_pagetable
+        kvminithart();
         c->proc = 0;
 
         found = 1;
