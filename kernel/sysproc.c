@@ -70,6 +70,7 @@ sys_sleep(void)
     sleep(&ticks, &tickslock);
   }
   release(&tickslock);
+  backtrace();
   return 0;
 }
 
@@ -94,4 +95,37 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64 
+sys_sigreturn(void)
+{
+  struct proc* p = myproc();
+  *p->trapframe = *p->alarm_trapframe;
+  p->whether_a_handler_is_going_on = 0;
+  return 0;
+}
+
+uint64 
+sys_sigalarm(void)
+{
+  int ticks;
+  void (*handler)();
+
+  struct proc* p = myproc();
+  ticks = p->trapframe->a0;
+  handler = (void(*)())p->trapframe->a1;
+  // printf("ticks = %d\n", ticks);
+  // printf("handler pointer = %p\n", handler);
+  if (ticks < 0) return -1;
+  if (ticks == 0 && handler == 0) {
+    p->alarm_interval = -1;
+    p->alarm_handler = 0;
+  } else {
+    p->alarm_interval = ticks;
+    p->alarm_handler = handler;
+    p->ticks_past_after_last_call = ticks;
+  }
+  // printf("p->alarm_iterval = %d\np->alarm_handler=%p\n", p->alarm_interval, p->alarm_handler);
+  return 0;
 }

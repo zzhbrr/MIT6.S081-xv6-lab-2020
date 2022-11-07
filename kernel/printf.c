@@ -121,6 +121,7 @@ panic(char *s)
   printf("panic: ");
   printf(s);
   printf("\n");
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
@@ -131,4 +132,18 @@ printfinit(void)
 {
   initlock(&pr.lock, "pr");
   pr.locking = 1;
+}
+
+void
+backtrace(void)
+{
+  uint64 s0 = r_fp(); // s0为目前执行的函数的stack frame pointer
+  uint64 stack_begin = PGROUNDUP(s0); // 栈开始的位置的虚拟地址
+  printf("backtrace:\n");
+  while(1) {
+    uint64 ra = *((uint64*)s0-1);
+    printf("%p\n", ra);
+    s0 = *((uint64*)s0-2);
+    if (s0 == stack_begin) break;
+  }
 }
