@@ -156,7 +156,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
-    if(*pte & PTE_V)
+    if((*pte & PTE_V) && (!(*pte & PTE_RSW1))) // 如果是COW的情况，不需要判断是否remap
       panic("remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
@@ -311,22 +311,30 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    // 需要修改原pte的flag, 设置成只读的, 并且把RSW第一位设置为1, 这样usertrap会发现这是一个COW的情况
     pa = PTE2PA(*pte);
+    *pte |= PTE_RSW1;
+    if(*pte & (PTE_W)) *pte -= PTE_W;
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0) {
       goto err;
     }
+    add_reference_count(pa);
+    // flags = PTE_FLAGS(*pte);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    //   kfree(mem);
+    //   goto err;
+    // }
   }
   return 0;
 
@@ -358,6 +366,26 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if (va0 > MAXVA) return -1;
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(pte == 0) return -1;
+    if(!(PTE_FLAGS(*pte)&PTE_W)) {
+      if(!(PTE_FLAGS(*pte)&PTE_RSW1)) {
+        return -1;
+      }
+      uint64 va = va0;
+      uint64 ka = (uint64)kalloc();
+       if(ka == 0) {
+         return -1;
+       } else {
+         uint64 flags = PTE_FLAGS(*pte);
+         flags = flags & ~PTE_RSW1;
+         uint64 pa = walkaddr(pagetable, va);
+         memmove((void*)ka, (void *)pa, PGSIZE);
+         uvmunmap(pagetable, va, 1, 1);
+         mappages(pagetable, va, 1, ka, flags | PTE_W);
+       }
+    }
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;

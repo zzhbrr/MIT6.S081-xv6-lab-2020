@@ -16,6 +16,10 @@ void kernelvec();
 
 extern int devintr();
 
+int whetherCOW(uint64);
+void COWPageFaultHandler(uint64);
+int uvmcowcopy(uint64 va);
+
 void
 trapinit(void)
 {
@@ -67,6 +71,18 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 15) {
+    uint64 va = r_stval();
+    if (whetherCOW(va)) { // 如果是COW引起的page fault
+      // printf("COWtrap\n");
+      // COWPageFaultHandler(va);
+      if (uvmcowcopy(va) == -1) {
+        p->killed = 1;
+      }
+    } else {
+      p->killed = 1;
+    }
+
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
@@ -218,3 +234,70 @@ devintr()
   }
 }
 
+int 
+whetherCOW(uint64 va) 
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  if ((pte = walk(p->pagetable, va, 0)) == 0)
+    panic("whetherCOW: pte not exist");
+  if ((va < p->sz) && (*pte & PTE_RSW1) && (*pte & PTE_V)) return 1;
+  return 0;
+}
+
+void
+COWPageFaultHandler(uint64 va) {
+  uint64 va_aligned = PGROUNDDOWN(va);
+  struct proc *p = myproc();
+  char *mem;
+  pte_t *pte;
+  uint64 pa, flags;
+  if ((pte = walk(p->pagetable, va_aligned, 0)) == 0)
+    panic("COWPageFaultHandler: pte not exist");
+  pa = PTE2PA(*pte);
+  // *pte -= PTE_RSW1; // 去掉RSW1
+  // *pte |= PTE_W; // 可读可写
+  flags = PTE_FLAGS(*pte);
+  flags -= PTE_RSW1;
+  flags |= PTE_W;
+  if ((mem = kcopy_page_cow((uint64)pa)) == 0) {
+    printf("alloc failed\n");
+    goto err;
+  }
+  uvmunmap(p->pagetable, va_aligned, 1, 0);
+  memmove(mem, (char*)pa, PGSIZE);
+  if(mappages(p->pagetable, va_aligned, PGSIZE, (uint64)mem, flags) != 0) {
+    printf("map failed\n");
+    goto err;
+  }
+  return ;
+  err:
+    uvmunmap(p->pagetable, va_aligned, 1, 1);
+    p->killed = 1;
+    printf("COWPageFaultHandler: %s is killed\n", p->name);
+}
+
+int uvmcowcopy(uint64 va) {
+  va = PGROUNDDOWN(va);
+  pte_t *pte;
+  struct proc *p = myproc();
+
+  if (va >= MAXVA) return -1;
+
+  if((pte = walk(p->pagetable, va, 0)) == 0)
+    panic("uvmcowcopy: walk");
+  
+  uint64 pa = PTE2PA(*pte);
+  // uint64 new = (uint64)kcopy_page_cow(pa); 
+  uint64 new = (uint64)kalloc(); 
+  if(new == 0)
+    return -1;
+  memmove((void*)new, (void *)pa, PGSIZE);
+  // 重新映射为可写，并清除 PTE_COW 标记
+  uint64 flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_RSW1;
+  uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 1);
+  if(mappages(p->pagetable, va, 1, new, flags) == -1) {
+    panic("uvmcowcopy: mappages");
+  }
+  return 0;
+}

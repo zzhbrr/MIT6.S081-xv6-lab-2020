@@ -63,6 +63,9 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+int             add_reference_count(uint64);
+int             minus_refrence_coun(uint64);
+void*           kcopy_page_cow(uint64);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -145,6 +148,7 @@ void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            usertrapret(void);
+int             uvmcowcopy(uint64);
 
 // uart.c
 void            uartinit(void);
@@ -171,6 +175,9 @@ uint64          walkaddr(pagetable_t, uint64);
 int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
+pte_t*          walk(pagetable_t, uint64, int);
+int             whetherCOW(uint64); 
+void            COWPageFaultHandler(uint64);
 
 // plic.c
 void            plicinit(void);
