@@ -308,11 +308,34 @@ sys_open(void)
       end_op();
       return -1;
     }
+    // printf("open a file, inum = %d, type = %d\n", ip->inum, ip->type);
     ilock(ip);
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
       return -1;
+    }
+    if(ip->type == T_SYMLINK) {
+      if(!(omode & O_NOFOLLOW)) { // 不是NoFollow模式，需要递归找最终的inode
+        // printf("finding symlinks\n");
+        int depth = 0;
+        while(ip->type == T_SYMLINK) {
+          depth ++;
+          if (depth > 20) {
+            end_op();
+            return -1;
+          }
+          char sym_path[MAXPATH];
+          if(readi(ip, 0, (uint64)sym_path, 0, ip->size) != ip->size)
+            panic("sys_open: symlink lookup");
+          iunlockput(ip);
+          if((ip = namei(sym_path)) == 0) {
+            end_op();
+            return -1;
+          }
+          ilock(ip);
+        }
+      }
     }
   }
 
@@ -482,5 +505,47 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// 获取父文件夹inode ip
+// 新建软链接的inode dp
+// 将dp作为新的directory entry添加到ip的文件夹内
+// 在dp对应的内容中写入target
+uint64
+sys_symlink(void) 
+{
+  char target[MAXPATH], path[MAXPATH];
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
+  begin_op();
+
+  if((ip = nameiparent(path, name)) == 0) { //ip: 父文件夹inode
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+  if((dp = ialloc(ip->dev, T_SYMLINK)) == 0) // dp: 新建软链接inode
+    panic("symlink: ialloc");
+  ilock(dp); // 因为是刚创建的，所以不会死锁 
+  dp->nlink = 1;
+  iupdate(dp);
+  // printf("create a symlink, inum = %d, type = %d\n", dp->inum, dp->type);
+  if (dirlink(ip, name, dp->inum) < 0) {
+    iunlockput(dp);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlock(ip);
+  int len = 0;
+  for (len = 0; target[len] != '\0'; len++);
+  if (writei(dp, 0, (uint64)target, 0, len) != len) 
+    panic("sys_symlink: dirlink");
+  iput(ip);
+  iunlockput(dp);
+  end_op();
   return 0;
 }
